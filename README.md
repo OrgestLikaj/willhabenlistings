@@ -72,6 +72,12 @@ when willhaben changes their data shape.
   Telegram and vice versa.
 - Gmail requires an App Password (myaccount.google.com -> Security -> 2-Step
   Verification -> App passwords). Regular passwords are rejected by SMTP.
+- `BONUS` maps a regex to `(points, "display label")`. The label is what goes
+  into messages - never the pattern itself, since regex syntax like
+  `(?<!kein )` contains `<` and breaks Telegram's HTML parser.
+- All listing text is HTML-escaped before sending. If a Telegram send still
+  fails on entity parsing, the same content is resent as plain text so a
+  notification is never lost.
 - Times use `TZ_NAME` (Europe/Vienna). GitHub runners are UTC, so without this
   the timestamps would be an hour or two off local time.
 

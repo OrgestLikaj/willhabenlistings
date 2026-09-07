@@ -15,6 +15,7 @@ With notifications:
     python scraper.py
 """
 
+import html
 import json
 import os
 import re
@@ -167,18 +168,22 @@ REQUIRE_ANY = [
 ]
 
 # --- scoring bonuses (negative values are penalties) ---------------------
+# pattern -> (points, display label). The label is what appears in messages -
+# never the raw pattern, which would contain regex syntax like (?<!kein ) and
+# break Telegram's HTML parser.
 BONUS = {
-    r"erstbezug|neubau": 10,
-    r"unbefristet": 10,
-    r"garage|stellplatz|carport|parkplatz": 8,
-    r"provisionsfrei|keine provision|ohne provision": 8,
-    r"(?<!kein )(?<!keine )keller|kellerabteil|abstellraum": 5,
-    r"kueche": 4,
-    r"bahnhof|\bbahn\b|\bbus\b": 4,
-    r"(?<!keine )haustiere?( sind)? erlaubt|hunde erlaubt|katzen erlaubt": 6,
-    r"fussbodenheizung|waermepumpe|photovoltaik": 5,
-    r"ablöse|abloese": -15,
-    r"sanierungsbedarf|renovierungsbedarf": -10,
+    r"erstbezug|neubau": (10, "first occupancy"),
+    r"unbefristet": (10, "unlimited lease"),
+    r"garage|stellplatz|carport|parkplatz": (8, "parking"),
+    r"provisionsfrei|keine provision|ohne provision": (8, "no commission"),
+    r"(?<!kein )(?<!keine )keller|kellerabteil|abstellraum": (5, "storage"),
+    r"kueche": (4, "fitted kitchen"),
+    r"bahnhof|\bbahn\b|\bbus\b": (4, "transit nearby"),
+    r"(?<!keine )haustiere?( sind)? erlaubt|hunde erlaubt|katzen erlaubt": (6, "pets allowed"),
+    r"fussbodenheizung|waermepumpe|photovoltaik": (5, "modern heating"),
+    r"lift|aufzug": (3, "lift"),
+    r"abloese": (-15, "Abloese required"),
+    r"sanierungsbedarf|renovierungsbedarf": (-10, "needs renovation"),
 }
 
 # --- detail page fetching -------------------------------------------------
@@ -419,10 +424,10 @@ def score(l, excluded_patterns=()):
         s += min(l["area"], 120) / 10
 
     matched = []
-    for pat, pts in BONUS.items():
+    for pat, (pts, label) in BONUS.items():
         if hit(l["text"], pat):
             s += pts
-            matched.append(f"{pat.split('|')[0]}{'' if pts > 0 else f' ({pts})'}")
+            matched.append(label if pts > 0 else f"{label} \u26a0")
 
     if excluded_patterns:
         s -= 200
@@ -466,6 +471,19 @@ def _send(text, silent=False):
         )
         if not r.ok:
             print(f"  Telegram error {r.status_code}: {r.text}")
+            # HTML parse failures should never lose a notification: resend the
+            # same content as plain text with the tags stripped.
+            if r.status_code == 400 and "parse entities" in r.text:
+                plain = html.unescape(re.sub(r"<[^>]+>", "", text))
+                r2 = requests.post(
+                    f"https://api.telegram.org/bot{token}/sendMessage",
+                    json={"chat_id": chat, "text": plain,
+                          "disable_notification": bool(silent)},
+                    timeout=20)
+                if r2.ok:
+                    print("  resent as plain text")
+                    return True
+                print(f"  plain-text retry also failed: {r2.text}")
             return False
         return True
     except requests.RequestException as e:
@@ -516,12 +534,14 @@ def duration(a, b):
 
 
 def listing_message(l):
-    msg = (f"🏠 <b>{l['title']}</b>\n"
+    title = html.escape(l["title"])
+    tags = ", ".join(html.escape(m) for m in l.get("matched", []))
+    msg = (f"🏠 <b>{title}</b>\n"
            f"{spec_line(l)}\n"
-           f"📍 {place(l)}")
-    if l.get("matched"):
-        msg += f"\n✨ {', '.join(l['matched'])[:200]}"
-    return msg + f"\n\n<a href=\"{l['url']}\">View on willhaben →</a>"
+           f"📍 {html.escape(place(l))}")
+    if tags:
+        msg += f"\n✨ {tags[:200]}"
+    return msg + f"\n\n<a href=\"{html.escape(l['url'], quote=True)}\">View on willhaben →</a>"
 
 
 def have_email():
@@ -571,11 +591,11 @@ def listings_email_html(new, window_from, window_to):
             f'<tr><td style="padding:16px 0;border-bottom:1px solid #eaeaea">'
             f'<div style="color:#999;font-size:12px">#{i}</div>'
             f'<a href="{l["url"]}" style="font-weight:600;color:#0b57d0;'
-            f'text-decoration:none;font-size:17px">{l["title"]}</a>'
+            f'text-decoration:none;font-size:17px">{html.escape(l["title"])}</a>'
             f'<div style="color:#222;margin-top:6px;font-size:15px">'
             f'{spec_line(l, sep=" &nbsp;·&nbsp; ")}</div>'
             f'<div style="color:#666;margin-top:2px;font-size:14px">'
-            f'📍 {place(l)}</div>'
+            f'📍 {html.escape(place(l))}</div>'
             f'{tags}'
             f'<div style="margin-top:8px">'
             f'<a href="{l["url"]}" style="color:#0b57d0;font-size:13px;'
@@ -689,8 +709,9 @@ def notify_listings(new, window_from, window_to):
         lines = [f"<b>Part {idx}/{len(chunks)}</b>"]
         for l in chunk:
             lines.append(
-                f"• <a href=\"{l['url']}\">{l['title'][:70]}</a>\n"
-                f"  {spec_line(l)} — {place(l)}")
+                f"• <a href=\"{html.escape(l['url'], quote=True)}\">"
+                f"{html.escape(l['title'][:70])}</a>\n"
+                f"  {spec_line(l)} — {html.escape(place(l))}")
         _send("\n".join(lines))
         time.sleep(1.5)
     print(f"sent {len(new)} listings in {len(chunks)} digest messages")
