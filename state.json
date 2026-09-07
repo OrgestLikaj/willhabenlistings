@@ -1,10 +1,10 @@
 {
-  "last_run": "2026-09-07T14:21:57.883627+02:00",
+  "last_run": "2026-09-07T17:48:08.011918+02:00",
   "last_result": {
-    "raw": 39,
-    "eligible": 31,
-    "new": 29,
-    "notified": 29,
+    "raw": 33,
+    "eligible": 25,
+    "new": 0,
+    "notified": 0,
     "rejected": 0
   }
 }
