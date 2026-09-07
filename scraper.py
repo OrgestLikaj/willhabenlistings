@@ -477,13 +477,51 @@ def have_telegram():
     return bool(os.environ.get("TG_TOKEN") and os.environ.get("TG_CHAT_ID"))
 
 
+def ppm(l):
+    """Rent per square metre, or None."""
+    if l.get("price") and l.get("area"):
+        return l["price"] / l["area"]
+    return None
+
+
+def fmt_num(v, suffix=""):
+    return f"{v:,.0f}{suffix}".replace(",", " ") if v is not None else "-"
+
+
+def place(l):
+    bits = [str(l["postcode"])] if l.get("postcode") else []
+    if l.get("district"):
+        bits.append(l["district"])
+    return " ".join(bits) or "location unknown"
+
+
+def spec_line(l, sep=" · "):
+    """e.g. "890 € · 64 m² · 2 rooms · 13.9 €/m²" """
+    parts = [f"{fmt_num(l.get('price'))} €", f"{fmt_num(l.get('area'))} m²"]
+    if l.get("rooms"):
+        n = int(l["rooms"])
+        parts.append(f"{n} room" + ("s" if n != 1 else ""))
+    p = ppm(l)
+    if p:
+        parts.append(f"{p:.1f} €/m²")
+    return sep.join(parts)
+
+
+def duration(a, b):
+    mins = max(0, int((b - a).total_seconds() // 60))
+    if mins < 60:
+        return f"{mins} min"
+    h, m = divmod(mins, 60)
+    return f"{h}h {m:02d}m"
+
+
 def listing_message(l):
     msg = (f"🏠 <b>{l['title']}</b>\n"
-           f"{l['price'] or '?'} € · {l['area'] or '?'} m² · "
-           f"{l['rooms'] or '?'} Zi · {l['postcode'] or ''} {l['district']}")
+           f"{spec_line(l)}\n"
+           f"📍 {place(l)}")
     if l.get("matched"):
-        msg += f"\n✅ {', '.join(l['matched'])[:200]}"
-    return msg + f"\n{l['url']}"
+        msg += f"\n✨ {', '.join(l['matched'])[:200]}"
+    return msg + f"\n\n<a href=\"{l['url']}\">View on willhaben →</a>"
 
 
 def have_email():
@@ -520,68 +558,107 @@ def _email_style():
 
 def listings_email_html(new, window_from, window_to):
     rows = []
-    for l in new:
-        bonus = (f'<div style="color:#0a7d2c;font-size:13px">✅ '
-                 f'{", ".join(l["matched"])}</div>') if l.get("matched") else ""
+    for i, l in enumerate(new, 1):
+        tags = ""
+        if l.get("matched"):
+            chips = "".join(
+                f'<span style="display:inline-block;background:#e7f5ec;'
+                f'color:#0a7d2c;border-radius:10px;padding:2px 8px;'
+                f'font-size:12px;margin:2px 4px 2px 0">{m}</span>'
+                for m in l["matched"])
+            tags = f'<div style="margin-top:6px">{chips}</div>'
         rows.append(
-            f'<tr><td style="padding:14px 0;border-bottom:1px solid #e5e5e5">'
+            f'<tr><td style="padding:16px 0;border-bottom:1px solid #eaeaea">'
+            f'<div style="color:#999;font-size:12px">#{i}</div>'
             f'<a href="{l["url"]}" style="font-weight:600;color:#0b57d0;'
-            f'text-decoration:none;font-size:16px">{l["title"]}</a>'
-            f'<div style="color:#444;margin-top:4px">'
-            f'{l["price"] or "?"} € &middot; {l["area"] or "?"} m² &middot; '
-            f'{l["rooms"] or "?"} Zi &middot; {l["postcode"] or ""} {l["district"]}'
-            f'</div>{bonus}'
-            f'<div style="color:#888;font-size:12px;margin-top:4px">{l["url"]}</div>'
+            f'text-decoration:none;font-size:17px">{l["title"]}</a>'
+            f'<div style="color:#222;margin-top:6px;font-size:15px">'
+            f'{spec_line(l, sep=" &nbsp;·&nbsp; ")}</div>'
+            f'<div style="color:#666;margin-top:2px;font-size:14px">'
+            f'📍 {place(l)}</div>'
+            f'{tags}'
+            f'<div style="margin-top:8px">'
+            f'<a href="{l["url"]}" style="color:#0b57d0;font-size:13px;'
+            f'text-decoration:none">View on willhaben &rarr;</a></div>'
             f'</td></tr>')
-    return (f'<div style="{_email_style()}">'
-            f'<h2 style="margin:0 0 4px">{len(new)} neue Inserate</h2>'
-            f'<div style="color:#666;font-size:13px;margin-bottom:8px">'
-            f'Zeitraum: {fmt_dt(window_from)} &rarr; {fmt_dt(window_to)}</div>'
+    n = len(new)
+    return (f'<div style="{_email_style()};max-width:640px">'
+            f'<h2 style="margin:0 0 2px;font-size:21px">'
+            f'{n} new listing{"s" if n != 1 else ""}</h2>'
+            f'<div style="color:#666;font-size:13px;margin-bottom:6px">'
+            f'Since last check: {fmt_dt(window_from)} &rarr; {fmt_dt(window_to)} '
+            f'({duration(window_from, window_to)})</div>'
             f'<table style="width:100%;border-collapse:collapse">'
-            f'{"".join(rows)}</table></div>')
+            f'{"".join(rows)}</table>'
+            f'<div style="color:#999;font-size:12px;margin-top:14px">'
+            f'Newest first. Sent by your willhaben watcher.</div>'
+            f'</div>')
 
 
 def listings_email_text(new, window_from, window_to):
-    lines = [f"{len(new)} neue Inserate",
-             f"Zeitraum: {fmt_dt(window_from)} -> {fmt_dt(window_to)}", ""]
-    for l in new:
-        lines += [l["title"],
-                  f"  {l['price'] or '?'} EUR | {l['area'] or '?'} m2 | "
-                  f"{l['rooms'] or '?'} Zi | {l['postcode'] or ''} {l['district']}"]
+    n = len(new)
+    lines = [f"{n} new listing{'s' if n != 1 else ''} on willhaben",
+             f"Since last check: {fmt_dt(window_from)} -> {fmt_dt(window_to)}"
+             f" ({duration(window_from, window_to)})",
+             "", "-" * 60, ""]
+    for i, l in enumerate(new, 1):
+        lines += [f"{i}. {l['title']}",
+                  f"   {spec_line(l, sep='  |  ')}",
+                  f"   {place(l)}"]
         if l.get("matched"):
-            lines.append(f"  Treffer: {', '.join(l['matched'])}")
-        lines += [f"  {l['url']}", ""]
+            lines.append(f"   Matches: {', '.join(l['matched'])}")
+        lines += [f"   {l['url']}", ""]
+    lines += ["-" * 60,
+              "Newest first. Sent by your willhaben watcher."]
     return "\n".join(lines)
 
 
 def heartbeat_email_text(window_from, window_to, stats):
-    return "\n".join([
-        "Keine neuen Inserate",
-        f"Zeitraum: {fmt_dt(window_from)} -> {fmt_dt(window_to)}",
+    lines = [
+        "No new listings",
+        f"Checked {fmt_dt(window_from)} -> {fmt_dt(window_to)}"
+        f" ({duration(window_from, window_to)})",
         "",
-        f"Treffer bei willhaben: {stats.get('total', '?')}",
-        f"Nach Preis/Groesse/Ort: {stats.get('eligible', 0)}",
-        f"Davon neu: {stats.get('new', 0)}",
-        f"Durch Textfilter abgelehnt: {stats.get('rejected', 0)}",
-    ])
+        f"  {stats.get('total', '?')} listings matched your willhaben search",
+        f"  {stats.get('eligible', 0)} met your price, size and location limits",
+        f"  {stats.get('new', 0)} were new since the last check",
+    ]
+    if stats.get("rejected"):
+        lines.append(f"  {stats['rejected']} filtered out by your keyword rules")
+    lines += ["", "Nothing to do. Next check in about an hour."]
+    return "\n".join(lines)
 
 
 def heartbeat_email_html(window_from, window_to, stats):
-    return (f'<div style="{_email_style()}">'
-            f'<h2 style="margin:0 0 4px">Keine neuen Inserate</h2>'
-            f'<div style="color:#666;font-size:13px">'
-            f'Zeitraum: {fmt_dt(window_from)} &rarr; {fmt_dt(window_to)}</div>'
-            f'<ul style="color:#444">'
-            f'<li>Treffer bei willhaben: {stats.get("total", "?")}</li>'
-            f'<li>Nach Preis/Größe/Ort: {stats.get("eligible", 0)}</li>'
-            f'<li>Davon neu: {stats.get("new", 0)}</li>'
-            f'<li>Durch Textfilter abgelehnt: {stats.get("rejected", 0)}</li>'
-            f'</ul></div>')
+    def row(label, value):
+        return (f'<tr><td style="padding:5px 14px 5px 0;color:#666;'
+                f'font-size:14px">{label}</td>'
+                f'<td style="padding:5px 0;font-weight:600;font-size:14px">'
+                f'{value}</td></tr>')
+    extra = ""
+    if stats.get("rejected"):
+        extra = (f'<div style="color:#666;font-size:13px;margin-top:12px">'
+                 f'{stats["rejected"]} new listing'
+                 f'{"s were" if stats["rejected"] != 1 else " was"} filtered out '
+                 f'by your keyword rules.</div>')
+    return (f'<div style="{_email_style()};max-width:640px">'
+            f'<h2 style="margin:0 0 2px;font-size:21px">No new listings</h2>'
+            f'<div style="color:#666;font-size:13px;margin-bottom:14px">'
+            f'Checked {fmt_dt(window_from)} &rarr; {fmt_dt(window_to)} '
+            f'({duration(window_from, window_to)})</div>'
+            f'<table style="border-collapse:collapse">'
+            f'{row("Matched your search", stats.get("total", "?"))}'
+            f'{row("Within price / size / location", stats.get("eligible", 0))}'
+            f'{row("New since last check", stats.get("new", 0))}'
+            f'</table>{extra}'
+            f'<div style="color:#999;font-size:12px;margin-top:16px">'
+            f'Nothing to do. Next check in about an hour.</div>'
+            f'</div>')
 
 
 def notify_listings(new, window_from, window_to):
     """Send every new listing. Individually if few, batched into digests if many."""
-    _send_email(f"[willhaben] {len(new)} neue Inserate",
+    _send_email(f"[willhaben] {len(new)} new listing{'s' if len(new) != 1 else ''}",
                 listings_email_html(new, window_from, window_to),
                 listings_email_text(new, window_from, window_to))
     if not have_email():
@@ -591,8 +668,9 @@ def notify_listings(new, window_from, window_to):
         print("No Telegram credentials set - skipping notifications")
         return
 
-    header = (f"🔔 <b>{len(new)} neue Inserate</b>\n"
-              f"{fmt_dt(window_from)} → {fmt_dt(window_to)}")
+    n = len(new)
+    header = (f"🔔 <b>{n} new listing{'s' if n != 1 else ''}</b>\n"
+              f"Since last check: {fmt_dt(window_from)} → {fmt_dt(window_to)}")
 
     if len(new) <= MAX_INDIVIDUAL:
         _send(header)
@@ -605,15 +683,14 @@ def notify_listings(new, window_from, window_to):
 
     # too many for one-per-message: batch them so nothing is dropped
     chunks = [new[i:i + DIGEST_CHUNK] for i in range(0, len(new), DIGEST_CHUNK)]
-    _send(header + f"\n(in {len(chunks)} Teilen)")
+    _send(header + f"\nSent in {len(chunks)} parts to keep things readable.")
     time.sleep(1.0)
-    for n, chunk in enumerate(chunks, 1):
-        lines = [f"<b>Teil {n}/{len(chunks)}</b>"]
+    for idx, chunk in enumerate(chunks, 1):
+        lines = [f"<b>Part {idx}/{len(chunks)}</b>"]
         for l in chunk:
             lines.append(
                 f"• <a href=\"{l['url']}\">{l['title'][:70]}</a>\n"
-                f"  {l['price'] or '?'} € · {l['area'] or '?'} m² · "
-                f"{l['postcode'] or ''} {l['district']}")
+                f"  {spec_line(l)} — {place(l)}")
         _send("\n".join(lines))
         time.sleep(1.5)
     print(f"sent {len(new)} listings in {len(chunks)} digest messages")
@@ -621,21 +698,24 @@ def notify_listings(new, window_from, window_to):
 
 def notify_heartbeat(window_from, window_to, stats):
     """Tell the user nothing new turned up in this window."""
-    _send_email("[willhaben] keine neuen Inserate",
+    _send_email("[willhaben] no new listings",
                 heartbeat_email_html(window_from, window_to, stats),
                 heartbeat_email_text(window_from, window_to, stats))
 
     if not have_telegram():
         print("No Telegram credentials set - skipping heartbeat")
         return
-    msg = (f"😴 <b>Keine neuen Inserate</b>\n"
-           f"Zeitraum: {fmt_dt(window_from)} → {fmt_dt(window_to)}\n"
+    msg = (f"🕰 <b>No new listings</b>\n"
+           f"Checked {fmt_dt(window_from)} → {fmt_dt(window_to)} "
+           f"({duration(window_from, window_to)})\n"
            f"\n"
-           f"Treffer bei willhaben: {stats.get('total', '?')}\n"
-           f"Nach Preis/Größe/Ort: {stats.get('eligible', 0)}\n"
-           f"Davon neu: {stats.get('new', 0)}")
+           f"{stats.get('total', '?')} listings matched your willhaben search, "
+           f"{stats.get('eligible', 0)} met your price, size and location limits, "
+           f"and none of them were new since the last check.")
     if stats.get("rejected"):
-        msg += f"\nDurch Textfilter abgelehnt: {stats['rejected']}"
+        msg += (f"\n\n{stats['rejected']} new one"
+                f"{'s were' if stats['rejected'] != 1 else ' was'} filtered out "
+                f"by your keyword rules (Gemeindebau / Genossenschaft etc).")
     _send(msg, silent=HEARTBEAT_SILENT)
     print("sent heartbeat")
 
