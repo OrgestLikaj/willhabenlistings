@@ -34,17 +34,36 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
         run: python scraper.py
 
+      # Never rebase the state files: seen.json is a set (union it) and
+      # state.json is a timestamp (newest wins). Rebasing them produces
+      # conflicts that cannot be resolved without a human.
       - name: Commit state
         run: |
+          set -e
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add seen.json state.json
-          git diff --staged --quiet && echo "nothing to commit" && exit 0
-          git commit -m "update state [skip ci]"
-          for i in 1 2 3 4 5; do
-            git push && exit 0
-            echo "push rejected, rebasing (attempt $i)"
-            git pull --rebase --autostash origin "${GITHUB_REF_NAME}"
+          mkdir -p /tmp/mine
+          cp seen.json /tmp/mine/seen.json 2>/dev/null || echo "[]" > /tmp/mine/seen.json
+          cp state.json /tmp/mine/state.json 2>/dev/null || echo "{}" > /tmp/mine/state.json
+
+          for attempt in 1 2 3 4 5; do
+            git fetch origin "${GITHUB_REF_NAME}"
+            git reset --hard FETCH_HEAD
+
+            python -c "import json,os; mine=set(json.load(open('/tmp/mine/seen.json'))); theirs=set(json.load(open('seen.json'))) if os.path.exists('seen.json') else set(); json.dump(sorted(mine|theirs), open('seen.json','w'), indent=0); print(f'seen.json: {len(mine)} mine + {len(theirs)} remote -> {len(mine|theirs)} total')"
+            cp /tmp/mine/state.json state.json
+
+            git add seen.json state.json
+            if git diff --staged --quiet; then
+              echo "nothing to commit"
+              exit 0
+            fi
+            git commit -m "update state [skip ci]"
+            if git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              echo "pushed on attempt ${attempt}"
+              exit 0
+            fi
+            echo "push rejected, retrying (attempt ${attempt})"
             sleep $((RANDOM % 5 + 2))
           done
           echo "could not push after 5 attempts"
