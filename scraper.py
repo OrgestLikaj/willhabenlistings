@@ -41,7 +41,7 @@ DEFAULT_URL = (
     "&rows=100"
     "&NO_OF_ROOMS_BUCKET=2X2"
     "&FREE_AREA/FREE_AREA_TYPE=20"
-    "&PRICE_TO=1000"
+    "&PRICE_TO=800"
     "&ESTATE_SIZE/LIVING_AREA_FROM=40"
 )
 
@@ -55,10 +55,23 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 # ============================================================ NUMERIC FILTERS
 
-MAX_PRICE = 800
-MIN_AREA = 40
+MAX_PRICE = 1000        # keep in sync with PRICE_TO in the search URL
+MIN_AREA = 40           # keep in sync with LIVING_AREA_FROM in the URL
 MIN_ROOMS = 0            # 0 = no room filter
-PRICE_PER_SQM_TARGET = 16.0   # €/m² below which a listing starts scoring well
+
+# Postal codes you will actually consider. Empty list = no location check.
+# This is a safety net: if the search URL's sfId expires or points at the wrong
+# region, everything gets rejected on location instead of quietly alerting you
+# about apartments in a city you are not looking in.
+#
+# Vienna:              1010, 1020, 1030 ... 1230 (districts 1-23)
+# Gaenserndorf area:   2231, 2232, 2241, 2244, 2251, 2262, 2273, 2285, 2295
+#
+# Uncomment ONE of these, or leave the empty list to disable the check.
+ALLOWED_POSTCODES = []
+# ALLOWED_POSTCODES = [1010, 1020, 1030, 1040, 1050, 1060, 1070, 1080, 1090,
+#                      1200, 1220]
+# ALLOWED_POSTCODES = [2231, 2232, 2241, 2244, 2251, 2262, 2273, 2285, 2295]
 
 # =============================================================== TEXT FILTERS
 #
@@ -285,6 +298,11 @@ def to_float(v):
         return None
 
 
+def to_int(v):
+    f = to_float(v)
+    return int(f) if f is not None else None
+
+
 def parse(ad):
     a = attrs(ad)
     seo = a.get("SEO_URL", "")
@@ -297,6 +315,7 @@ def parse(ad):
         "area": to_float(a.get("ESTATE_SIZE/LIVING_AREA") or a.get("ESTATE_SIZE")),
         "rooms": to_float(a.get("NUMBER_OF_ROOMS")),
         "district": a.get("DISTRICT") or a.get("LOCATION") or "",
+        "postcode": to_int(a.get("POSTCODE") or a.get("POSTALCODE")),
         "url": "https://www.willhaben.at/iad/" + seo if seo else "",
     }
 
@@ -305,6 +324,8 @@ def parse(ad):
 
 def passes_numeric(l):
     """Cheap checks, run before spending a request on the detail page."""
+    if ALLOWED_POSTCODES and l["postcode"] not in ALLOWED_POSTCODES:
+        return False
     if l["price"] and l["price"] > MAX_PRICE:
         return False
     if l["area"] and l["area"] < MIN_AREA:
@@ -330,10 +351,9 @@ def text_verdict(l):
 
 
 def score(l, excluded_patterns=()):
+    """Keyword-based only. Price does not influence the score - listings are
+    kept in willhaben's own newest-first order (see main)."""
     s = 0.0
-    if l["price"] and l["area"]:
-        ppm = l["price"] / l["area"]
-        s += max(0, PRICE_PER_SQM_TARGET - ppm) * 8
     if l["area"]:
         s += min(l["area"], 120) / 10
 
@@ -409,8 +429,11 @@ def main():
     print(f"Fetched {len(ads)} raw listings")
 
     listings = [parse(a) for a in ads]
+    if not ALLOWED_POSTCODES:
+        codes = sorted({l["postcode"] for l in listings if l["postcode"]})
+        print(f"postcode check OFF - results are in: {codes}")
     listings = [l for l in listings if l["id"] and passes_numeric(l)]
-    print(f"{len(listings)} passed price/size checks")
+    print(f"{len(listings)} passed price/size/location checks")
 
     seen = load_seen()
     candidates = [l for l in listings if l["id"] not in seen]
@@ -431,11 +454,13 @@ def main():
         else:
             print(f"  rejected [{', '.join(reasons)}]: {l['title']}")
 
-    kept.sort(key=lambda x: -x["score"])
-    print(f"{len(kept)} passed everything")
+    # willhaben returns newest first; a fresher listing beats a higher score.
+    # Uncomment to rank by keyword score instead:
+    # kept.sort(key=lambda x: -x["score"])
+    print(f"{len(kept)} passed everything (newest first)")
     for l in kept:
         print(f"  [{l['score']:>7}] {l['price']} EUR  {l['area']} m2  "
-              f"{l['district']} - {l['title']}")
+              f"{l['postcode'] or '?'} {l['district']} - {l['title']}")
         print(f"            matched: {', '.join(l['matched']) or '-'}")
         print(f"            {l['url']}")
 
