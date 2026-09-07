@@ -18,7 +18,10 @@ With notifications:
 import json
 import os
 import re
+import smtplib
 import time
+from datetime import datetime, timezone
+from email.message import EmailMessage
 
 import requests
 
@@ -48,7 +51,30 @@ DEFAULT_URL = (
 SEARCH_URL = os.environ.get("WILLHABEN_URL", DEFAULT_URL)
 
 SEEN_FILE = "seen.json"
-MAX_NOTIFY = 10          # never send more than this many messages in one run
+STATE_FILE = "state.json"     # remembers when the previous run finished
+TZ_NAME = "Europe/Vienna"
+
+# Notification policy. Every new listing is reported - nothing is silently
+# dropped. Below MAX_INDIVIDUAL they get one rich message each; above that they
+# are batched into digests of DIGEST_CHUNK so a big backlog does not turn into
+# 90 separate phone buzzes.
+MAX_INDIVIDUAL = 15
+DIGEST_CHUNK = 10
+
+# Send a "no new listings" message covering the window since the last run.
+HEARTBEAT = True
+# Heartbeats arrive silently (no sound/vibration); real listings do not.
+HEARTBEAT_SILENT = True
+
+# --- email (second channel, sent in addition to Telegram) ---
+# One email per run containing every new listing, not one email per listing.
+EMAIL_ENABLED = True
+EMAIL_TO = "orgest.likaj23@gmail.com"
+SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = 465                     # 465 = implicit SSL
+# Credentials come from the environment / GitHub secrets:
+#   SMTP_USER = the sending Gmail address
+#   SMTP_PASS = a Google App Password (NOT your account password)
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
@@ -168,6 +194,41 @@ SOFT_EXCLUDE = False
 
 
 # ================================================================== HELPERS
+
+def now_local():
+    """Timezone-aware current time in TZ_NAME, falling back to UTC."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo(TZ_NAME))
+    except Exception:
+        return datetime.now(timezone.utc)
+
+
+def fmt_dt(dt):
+    return dt.strftime("%d.%m.%Y %H:%M") if dt else "?"
+
+
+def load_state():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, ValueError):
+            print(f"{STATE_FILE} is unreadable - starting fresh")
+    return {}
+
+
+def save_state(state):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
+
+
+def parse_dt(s):
+    try:
+        return datetime.fromisoformat(s) if s else None
+    except (ValueError, TypeError):
+        return None
+
 
 def fold(s):
     """Lowercase and normalise German umlauts so patterns match either spelling."""
@@ -390,40 +451,204 @@ def save_seen(ids):
 
 # ============================================================== NOTIFICATION
 
-def notify_telegram(new):
+def _send(text, silent=False):
+    """Single Telegram send. Returns True on success."""
     token, chat = os.environ.get("TG_TOKEN"), os.environ.get("TG_CHAT_ID")
     if not (token and chat):
+        return False
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat, "text": text, "parse_mode": "HTML",
+                  "disable_web_page_preview": False,
+                  "disable_notification": bool(silent)},
+            timeout=20,
+        )
+        if not r.ok:
+            print(f"  Telegram error {r.status_code}: {r.text}")
+            return False
+        return True
+    except requests.RequestException as e:
+        print(f"  Telegram request failed: {e}")
+        return False
+
+
+def have_telegram():
+    return bool(os.environ.get("TG_TOKEN") and os.environ.get("TG_CHAT_ID"))
+
+
+def listing_message(l):
+    msg = (f"🏠 <b>{l['title']}</b>\n"
+           f"{l['price'] or '?'} € · {l['area'] or '?'} m² · "
+           f"{l['rooms'] or '?'} Zi · {l['postcode'] or ''} {l['district']}")
+    if l.get("matched"):
+        msg += f"\n✅ {', '.join(l['matched'])[:200]}"
+    return msg + f"\n{l['url']}"
+
+
+def have_email():
+    return bool(EMAIL_ENABLED and EMAIL_TO
+                and os.environ.get("SMTP_USER") and os.environ.get("SMTP_PASS"))
+
+
+def _send_email(subject, html, text_fallback=""):
+    """Send one HTML email. Returns True on success."""
+    if not have_email():
+        return False
+    user, pw = os.environ["SMTP_USER"], os.environ["SMTP_PASS"]
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = user
+    msg["To"] = EMAIL_TO
+    msg.set_content(text_fallback or re.sub(r"<[^>]+>", "", html))
+    msg.add_alternative(html, subtype="html")
+    try:
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30) as s:
+            s.login(user, pw)
+            s.send_message(msg)
+        print(f"emailed: {subject}")
+        return True
+    except Exception as e:
+        print(f"  email failed: {type(e).__name__}: {e}")
+        return False
+
+
+def _email_style():
+    return ("font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;"
+            "font-size:15px;color:#1a1a1a;line-height:1.5")
+
+
+def listings_email_html(new, window_from, window_to):
+    rows = []
+    for l in new:
+        bonus = (f'<div style="color:#0a7d2c;font-size:13px">✅ '
+                 f'{", ".join(l["matched"])}</div>') if l.get("matched") else ""
+        rows.append(
+            f'<tr><td style="padding:14px 0;border-bottom:1px solid #e5e5e5">'
+            f'<a href="{l["url"]}" style="font-weight:600;color:#0b57d0;'
+            f'text-decoration:none;font-size:16px">{l["title"]}</a>'
+            f'<div style="color:#444;margin-top:4px">'
+            f'{l["price"] or "?"} € &middot; {l["area"] or "?"} m² &middot; '
+            f'{l["rooms"] or "?"} Zi &middot; {l["postcode"] or ""} {l["district"]}'
+            f'</div>{bonus}'
+            f'<div style="color:#888;font-size:12px;margin-top:4px">{l["url"]}</div>'
+            f'</td></tr>')
+    return (f'<div style="{_email_style()}">'
+            f'<h2 style="margin:0 0 4px">{len(new)} neue Inserate</h2>'
+            f'<div style="color:#666;font-size:13px;margin-bottom:8px">'
+            f'Zeitraum: {fmt_dt(window_from)} &rarr; {fmt_dt(window_to)}</div>'
+            f'<table style="width:100%;border-collapse:collapse">'
+            f'{"".join(rows)}</table></div>')
+
+
+def listings_email_text(new, window_from, window_to):
+    lines = [f"{len(new)} neue Inserate",
+             f"Zeitraum: {fmt_dt(window_from)} -> {fmt_dt(window_to)}", ""]
+    for l in new:
+        lines += [l["title"],
+                  f"  {l['price'] or '?'} EUR | {l['area'] or '?'} m2 | "
+                  f"{l['rooms'] or '?'} Zi | {l['postcode'] or ''} {l['district']}"]
+        if l.get("matched"):
+            lines.append(f"  Treffer: {', '.join(l['matched'])}")
+        lines += [f"  {l['url']}", ""]
+    return "\n".join(lines)
+
+
+def heartbeat_email_text(window_from, window_to, stats):
+    return "\n".join([
+        "Keine neuen Inserate",
+        f"Zeitraum: {fmt_dt(window_from)} -> {fmt_dt(window_to)}",
+        "",
+        f"Treffer bei willhaben: {stats.get('total', '?')}",
+        f"Nach Preis/Groesse/Ort: {stats.get('eligible', 0)}",
+        f"Davon neu: {stats.get('new', 0)}",
+        f"Durch Textfilter abgelehnt: {stats.get('rejected', 0)}",
+    ])
+
+
+def heartbeat_email_html(window_from, window_to, stats):
+    return (f'<div style="{_email_style()}">'
+            f'<h2 style="margin:0 0 4px">Keine neuen Inserate</h2>'
+            f'<div style="color:#666;font-size:13px">'
+            f'Zeitraum: {fmt_dt(window_from)} &rarr; {fmt_dt(window_to)}</div>'
+            f'<ul style="color:#444">'
+            f'<li>Treffer bei willhaben: {stats.get("total", "?")}</li>'
+            f'<li>Nach Preis/Größe/Ort: {stats.get("eligible", 0)}</li>'
+            f'<li>Davon neu: {stats.get("new", 0)}</li>'
+            f'<li>Durch Textfilter abgelehnt: {stats.get("rejected", 0)}</li>'
+            f'</ul></div>')
+
+
+def notify_listings(new, window_from, window_to):
+    """Send every new listing. Individually if few, batched into digests if many."""
+    _send_email(f"[willhaben] {len(new)} neue Inserate",
+                listings_email_html(new, window_from, window_to),
+                listings_email_text(new, window_from, window_to))
+    if not have_email():
+        print("No SMTP credentials set - skipping email")
+
+    if not have_telegram():
         print("No Telegram credentials set - skipping notifications")
         return
 
-    batch = new[:MAX_NOTIFY]
-    if len(new) > MAX_NOTIFY:
-        print(f"Capping notifications at {MAX_NOTIFY} (of {len(new)})")
+    header = (f"🔔 <b>{len(new)} neue Inserate</b>\n"
+              f"{fmt_dt(window_from)} → {fmt_dt(window_to)}")
 
-    for l in batch:
-        msg = (f"🏠 <b>{l['title']}</b>\n"
-               f"{l['price'] or '?'} € · {l['area'] or '?'} m² · "
-               f"{l['rooms'] or '?'} Zi · {l['district']}\n"
-               f"Score: {l['score']}")
-        if l.get("matched"):
-            msg += f"\n✅ {', '.join(l['matched'])[:200]}"
-        msg += f"\n{l['url']}"
-        try:
-            r = requests.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                json={"chat_id": chat, "text": msg, "parse_mode": "HTML"},
-                timeout=20,
-            )
-            if not r.ok:
-                print(f"Telegram error {r.status_code}: {r.text}")
-        except requests.RequestException as e:
-            print(f"Telegram request failed: {e}")
-        time.sleep(1.5)      # stay under the per-chat rate limit
+    if len(new) <= MAX_INDIVIDUAL:
+        _send(header)
+        time.sleep(1.0)
+        for l in new:
+            _send(listing_message(l))
+            time.sleep(1.5)      # stay under the per-chat rate limit
+        print(f"sent {len(new)} individual messages")
+        return
+
+    # too many for one-per-message: batch them so nothing is dropped
+    chunks = [new[i:i + DIGEST_CHUNK] for i in range(0, len(new), DIGEST_CHUNK)]
+    _send(header + f"\n(in {len(chunks)} Teilen)")
+    time.sleep(1.0)
+    for n, chunk in enumerate(chunks, 1):
+        lines = [f"<b>Teil {n}/{len(chunks)}</b>"]
+        for l in chunk:
+            lines.append(
+                f"• <a href=\"{l['url']}\">{l['title'][:70]}</a>\n"
+                f"  {l['price'] or '?'} € · {l['area'] or '?'} m² · "
+                f"{l['postcode'] or ''} {l['district']}")
+        _send("\n".join(lines))
+        time.sleep(1.5)
+    print(f"sent {len(new)} listings in {len(chunks)} digest messages")
+
+
+def notify_heartbeat(window_from, window_to, stats):
+    """Tell the user nothing new turned up in this window."""
+    _send_email("[willhaben] keine neuen Inserate",
+                heartbeat_email_html(window_from, window_to, stats),
+                heartbeat_email_text(window_from, window_to, stats))
+
+    if not have_telegram():
+        print("No Telegram credentials set - skipping heartbeat")
+        return
+    msg = (f"😴 <b>Keine neuen Inserate</b>\n"
+           f"Zeitraum: {fmt_dt(window_from)} → {fmt_dt(window_to)}\n"
+           f"\n"
+           f"Treffer bei willhaben: {stats.get('total', '?')}\n"
+           f"Nach Preis/Größe/Ort: {stats.get('eligible', 0)}\n"
+           f"Davon neu: {stats.get('new', 0)}")
+    if stats.get("rejected"):
+        msg += f"\nDurch Textfilter abgelehnt: {stats['rejected']}"
+    _send(msg, silent=HEARTBEAT_SILENT)
+    print("sent heartbeat")
 
 
 # ====================================================================== MAIN
 
 def main():
+    started = now_local()
+    state = load_state()
+    prev_run = parse_dt(state.get("last_run")) or started
+    print(f"run started {fmt_dt(started)} (previous run: "
+          f"{fmt_dt(parse_dt(state.get('last_run')))})")
+
     print(f"Fetching: {SEARCH_URL}")
     ads = fetch_listings(SEARCH_URL)
     print(f"Fetched {len(ads)} raw listings")
@@ -432,6 +657,7 @@ def main():
     if not ALLOWED_POSTCODES:
         codes = sorted({l["postcode"] for l in listings if l["postcode"]})
         print(f"postcode check OFF - results are in: {codes}")
+    total_raw = len(listings)
     listings = [l for l in listings if l["id"] and passes_numeric(l)]
     print(f"{len(listings)} passed price/size/location checks")
 
@@ -440,7 +666,7 @@ def main():
     print(f"{len(candidates)} are new - applying text rules"
           f"{' (SOFT_EXCLUDE on)' if SOFT_EXCLUDE else ''}")
 
-    kept = []
+    kept, rejected = [], 0
     for l in candidates:
         l["text"] = fold(l["title"] + " " + l["org"])
         if FETCH_DETAILS and l["url"]:
@@ -452,6 +678,7 @@ def main():
             l["score"] = score(l, reasons if SOFT_EXCLUDE else ())
             kept.append(l)
         else:
+            rejected += 1
             print(f"  rejected [{', '.join(reasons)}]: {l['title']}")
 
     # willhaben returns newest first; a fresher listing beats a higher score.
@@ -464,12 +691,33 @@ def main():
         print(f"            matched: {', '.join(l['matched']) or '-'}")
         print(f"            {l['url']}")
 
-    if kept:
-        notify_telegram(kept)
+    finished = now_local()
 
-    # Mark every numerically-eligible listing as seen, including text rejects,
-    # so their detail pages are not fetched again next hour.
+    if kept:
+        notify_listings(kept, prev_run, finished)
+    elif HEARTBEAT:
+        notify_heartbeat(prev_run, finished, {
+            "total": total_raw,
+            "eligible": len(listings),
+            "new": len(candidates),
+            "rejected": rejected,
+        })
+
+    # Mark every eligible listing as seen, including text rejects, so their
+    # detail pages are not fetched again next hour.
     save_seen(seen | {l["id"] for l in listings})
+
+    state["last_run"] = finished.isoformat()
+    state["last_result"] = {
+        "raw": total_raw,
+        "eligible": len(listings),
+        "new": len(candidates),
+        "notified": len(kept),
+        "rejected": rejected,
+    }
+    save_state(state)
+    print(f"run finished {fmt_dt(finished)} "
+          f"({(finished - started).total_seconds():.0f}s)")
 
 
 if __name__ == "__main__":
